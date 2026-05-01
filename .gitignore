@@ -1,0 +1,8 @@
+.env
+*.db
+*.log
+pw_sessions/
+screenshots/
+__pycache__/
+*.pyc
+.DS_Store
