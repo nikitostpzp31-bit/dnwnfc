@@ -138,6 +138,8 @@ def _pw_args() -> dict:
         "q1_answer": cfg["q1_answer"],
         "q2_text":   cfg["q2_text"],
         "q2_answer": cfg["q2_answer"],
+        "q3_text":   cfg.get("q3_text", ""),
+        "q3_answer": cfg.get("q3_answer", ""),
         "tfa_queue": _tfa_queue,
         "notify_fn": notify,
     }
@@ -711,6 +713,7 @@ async def cmd_login(m: Message):
                 cfg["q1_text"], cfg["q1_answer"],
                 cfg["q2_text"], cfg["q2_answer"],
                 _tfa_queue, notify,
+                cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
             ),
             timeout=180,
         )
