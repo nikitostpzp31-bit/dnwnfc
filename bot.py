@@ -71,6 +71,11 @@ class TwoFA(StatesGroup):
     waiting_code = State()
 
 
+class QuickSetup(StatesGroup):
+    waiting_text = State()
+    confirm      = State()
+
+
 # ---------------------------------------------------------------------------
 # Охранник — только владелец
 # ---------------------------------------------------------------------------
@@ -482,6 +487,203 @@ async def setup_cancel_cb(cb: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await cb.message.answer("❌ Настройка отменена.", reply_markup=main_kb())
+    await cb.answer()
+
+
+# ---------------------------------------------------------------------------
+# /quicksetup — добавление аккаунта одним сообщением
+# ---------------------------------------------------------------------------
+
+def _parse_account_text(text: str) -> dict:
+    """
+    Парсит свободный текст с данными аккаунта.
+    Поддерживает форматы:
+      почта - user@example.com
+      пароль - Qwert4291
+      1 вопрос - текст вопроса - ответ
+      дата - 21/03/1976
+    """
+    import re
+    result = {
+        "email": "", "password": "", "birthdate": "",
+        "q1_text": "", "q1_answer": "",
+        "q2_text": "", "q2_answer": "",
+        "q3_text": "", "q3_answer": "",
+    }
+
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+
+    for line in lines:
+        ll = line.lower()
+
+        # Email
+        if any(k in ll for k in ["почта", "email", "mail", "логин", "login"]):
+            m = re.search(r"[\w.%+\-]+@[\w.\-]+\.[a-z]{2,}", line, re.I)
+            if m:
+                result["email"] = m.group(0)
+
+        # Пароль
+        elif any(k in ll for k in ["пароль", "password", "pass"]):
+            parts = re.split(r"\s*[-–—:]\s*", line, maxsplit=1)
+            if len(parts) == 2:
+                result["password"] = parts[1].strip()
+
+        # Дата рождения
+        elif any(k in ll for k in ["дата", "date", "рожден", "birthday", "birth"]):
+            m = re.search(r"(\d{1,2})[./\-](\d{1,2})[./\-](\d{2,4})", line)
+            if m:
+                d, mo, y = m.group(1), m.group(2), m.group(3)
+                if len(y) == 2:
+                    y = "19" + y
+                result["birthdate"] = f"{d.zfill(2)}.{mo.zfill(2)}.{y}"
+
+        # Вопросы — формат: "1 вопрос - текст вопроса - ответ"
+        # или "вопрос 1 - текст - ответ"
+        elif re.search(r"(вопрос|question)\s*[1-3]|[1-3]\s*(вопрос|question)", ll):
+            # Определяем номер вопроса
+            num_m = re.search(r"[1-3]", ll)
+            num = int(num_m.group(0)) if num_m else 1
+
+            # Убираем префикс "N вопрос" или "вопрос N"
+            cleaned = re.sub(
+                r"^.*?(вопрос|question)\s*[1-3]\s*[-–—:]\s*|^[1-3]\s*(вопрос|question)\s*[-–—:]\s*",
+                "", line, flags=re.I
+            ).strip()
+
+            # Разбиваем оставшееся на "текст вопроса - ответ"
+            # Ответ — последний сегмент после последнего разделителя
+            parts = re.split(r"\s*[-–—]\s*", cleaned)
+            if len(parts) >= 2:
+                q_text  = " - ".join(parts[:-1]).strip()
+                q_answer = parts[-1].strip()
+            elif len(parts) == 1:
+                q_text   = parts[0].strip()
+                q_answer = ""
+            else:
+                continue
+
+            if num == 1:
+                result["q1_text"]   = q_text
+                result["q1_answer"] = q_answer
+            elif num == 2:
+                result["q2_text"]   = q_text
+                result["q2_answer"] = q_answer
+            elif num == 3:
+                result["q3_text"]   = q_text
+                result["q3_answer"] = q_answer
+
+    return result
+
+
+@router.message(Command("quicksetup"))
+async def cmd_quicksetup(m: Message, state: FSMContext):
+    if not await guard(m):
+        return
+    await state.set_state(QuickSetup.waiting_text)
+    await m.answer(
+        "📋 <b>Быстрое добавление аккаунта</b>\n\n"
+        "Отправьте данные в любом формате, например:\n\n"
+        "<code>почта - user@icloud.com\n"
+        "пароль - Qwert4291\n"
+        "1 вопрос - 你少年时代最好的朋友叫什么名字 - py777\n"
+        "2 вопрос - 你的理想工作是什么 - gz777\n"
+        "3 вопрос - 你的父母是在哪里认识的 - fm777\n"
+        "дата - 21/03/1976</code>\n\n"
+        "⚠️ <i>Сообщение будет удалено сразу после отправки</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(StateFilter(QuickSetup.waiting_text))
+async def quicksetup_text(m: Message, state: FSMContext):
+    if not await guard(m):
+        return
+    # Удаляем сообщение с паролем немедленно
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+    parsed = _parse_account_text(m.text or "")
+
+    if not parsed["email"]:
+        await m.answer(
+            "❌ Email не найден. Попробуйте ещё раз — отправьте /quicksetup",
+            reply_markup=main_kb(),
+        )
+        await state.clear()
+        return
+
+    await state.update_data(parsed=parsed)
+    await state.set_state(QuickSetup.confirm)
+
+    # Показываем что распознали (без пароля в открытом виде)
+    q_lines = []
+    for i, (qt, qa) in enumerate([
+        (parsed["q1_text"], parsed["q1_answer"]),
+        (parsed["q2_text"], parsed["q2_answer"]),
+        (parsed["q3_text"], parsed["q3_answer"]),
+    ], 1):
+        if qt:
+            q_lines.append(f"❓ Вопрос {i}: {qt[:40]}…\n   Ответ: <code>{qa}</code>")
+
+    text = (
+        "✅ <b>Распознано — проверьте данные:</b>\n\n"
+        f"📧 Email: <code>{parsed['email']}</code>\n"
+        f"🔑 Пароль: <code>{'*' * len(parsed['password'])}</code>\n"
+        f"📅 Дата: {parsed['birthdate'] or '—'}\n"
+        + ("\n" + "\n".join(q_lines) if q_lines else "\n❓ Вопросы: не найдены")
+        + "\n\nСохранить?"
+    )
+    await m.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=yn_kb("quicksetup_save", "quicksetup_cancel"),
+    )
+
+
+@router.callback_query(F.data == "quicksetup_save")
+async def quicksetup_save(cb: CallbackQuery, state: FSMContext):
+    if not await guard(cb):
+        return
+    data = await state.get_data()
+    parsed = data.get("parsed", {})
+    await state.clear()
+
+    # Сохраняем в конфиг (пароль и ответы шифруются Fernet)
+    db.set_config("email",     parsed["email"])
+    db.set_config("password",  parsed["password"])
+    db.set_config("q1_text",   parsed["q1_text"])
+    db.set_config("q1_answer", parsed["q1_answer"])
+    db.set_config("q2_text",   parsed["q2_text"])
+    db.set_config("q2_answer", parsed["q2_answer"])
+    # Третий вопрос сохраняем в отдельные ключи
+    if parsed.get("q3_text"):
+        db.set_config("q3_text",   parsed["q3_text"])
+        db.set_config("q3_answer", parsed["q3_answer"])
+    if parsed.get("birthdate"):
+        db.set_config("birthdate", parsed["birthdate"])
+
+    db.log_action("quicksetup", parsed["email"], "ok")
+    logger.info(f"[quicksetup] Аккаунт сохранён: {parsed['email']}")
+
+    await cb.message.answer(
+        f"✅ <b>Аккаунт сохранён!</b>\n"
+        f"📧 <code>{parsed['email']}</code>\n\n"
+        "Теперь: /login → /monitor start",
+        parse_mode="HTML",
+        reply_markup=main_kb(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "quicksetup_cancel")
+async def quicksetup_cancel(cb: CallbackQuery, state: FSMContext):
+    if not await guard(cb):
+        return
+    await state.clear()
+    await cb.message.answer("❌ Отменено.", reply_markup=main_kb())
     await cb.answer()
 
 

@@ -46,6 +46,10 @@ def _decrypt(value: str) -> str:
         return value
 
 
+# Расширенный список чувствительных ключей (включая 3-й вопрос)
+_SENSITIVE_KEYS = {"password", "q1_answer", "q2_answer", "q3_answer"}
+
+
 # ---------------------------------------------------------------------------
 # Соединение
 # ---------------------------------------------------------------------------
@@ -105,8 +109,7 @@ def init_db() -> None:
 
 def set_config(key: str, value: str) -> None:
     """Сохраняет значение (чувствительные данные шифруются)."""
-    sensitive = {"password", "q1_answer", "q2_answer"}
-    stored = _encrypt(value) if key in sensitive else value
+    stored = _encrypt(value) if key in _SENSITIVE_KEYS else value
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO bot_config(key, value, updated_at) VALUES(?, ?, datetime('now')) "
@@ -117,12 +120,11 @@ def set_config(key: str, value: str) -> None:
 
 def get_config(key: str, default: str = "") -> str:
     """Читает значение (расшифровывает если нужно)."""
-    sensitive = {"password", "q1_answer", "q2_answer"}
     with get_conn() as conn:
         row = conn.execute("SELECT value FROM bot_config WHERE key=?", (key,)).fetchone()
     if row is None:
         return default
-    return _decrypt(row[0]) if key in sensitive else row[0]
+    return _decrypt(row[0]) if key in _SENSITIVE_KEYS else row[0]
 
 
 def get_setup() -> dict:
@@ -134,6 +136,9 @@ def get_setup() -> dict:
         "q1_answer":   get_config("q1_answer"),
         "q2_text":     get_config("q2_text"),
         "q2_answer":   get_config("q2_answer"),
+        "q3_text":     get_config("q3_text"),
+        "q3_answer":   get_config("q3_answer"),
+        "birthdate":   get_config("birthdate"),
         "autoprotect": get_config("autoprotect", "off"),
         "monitor":     get_config("monitor", "off"),
         "last_login":  get_config("last_login", ""),
