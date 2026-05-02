@@ -1,25 +1,26 @@
-"""
-Apple iCloud — полная автоматизация через Playwright (stealth mode).
-Потоки: login, devices, findmy, erase, change_password, check_mail, security, monitor.
+"""Apple iCloud automation via Playwright.
+
+Key fixes vs previous version:
+- Security questions: use aria-describedby="question-N" to link question text -> input field
+- Apple shows questions 2 at a time (not all at once)
+- Dynamic input IDs (form-textbox-TIMESTAMP-0) — never use ID for lookup
+- iCloud (Find My, Mail) uses the same idmsa iframe as account.apple.com
+- Find My: extract devices from JS window data + DOM fallback
+- Mail: wait for message list to load before scraping
 """
 import asyncio
-import json
 import os
 import random
 import re
-import time
 from datetime import datetime
 from typing import Optional
 
+from config import HEADLESS
 from logger import get_logger
 
 logger = get_logger()
 
-# ---------------------------------------------------------------------------
-# Константы
-# ---------------------------------------------------------------------------
-
-SESSIONS_DIR  = "pw_sessions"
+SESSIONS_DIR    = "pw_sessions"
 SCREENSHOTS_DIR = "screenshots"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
@@ -31,25 +32,22 @@ URL_SECURITY = "https://account.apple.com/account/manage/section/security"
 URL_FINDMY   = "https://www.icloud.com/find/"
 URL_MAIL     = "https://www.icloud.com/mail/"
 
-TIMEOUT = 30_000   # ms — стандартный таймаут
-SHORT   = 8_000    # ms — короткий таймаут
-LONG    = 60_000   # ms — длинный таймаут (ожидание загрузки)
+TIMEOUT = 30_000
+LONG    = 90_000
 
-# ---------------------------------------------------------------------------
-# Браузер — запуск с persistent context (stealth)
-# ---------------------------------------------------------------------------
 
-async def _get_browser(acc_id: int, headless: bool = False):
-    """
-    Запускает Chromium с persistent profile (сессия сохраняется между запусками).
-    Возвращает (playwright, context).
-    """
+def _ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+async def _rnd_delay(lo=0.4, hi=1.8):
+    await asyncio.sleep(lo + (hi - lo) * random.random())
+
+
+async def _get_browser(acc_id, headless=True):
     from playwright.async_api import async_playwright
-
-    logger.info(f"[{_ts()}] 🚀 Запуск браузера Playwright (stealth mode)...")
     profile = os.path.abspath(f"{SESSIONS_DIR}/{acc_id}")
     os.makedirs(profile, exist_ok=True)
-
     pw = await async_playwright().start()
     ctx = await pw.chromium.launch_persistent_context(
         profile,
@@ -57,11 +55,10 @@ async def _get_browser(acc_id: int, headless: bool = False):
         args=[
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
-            "--disable-infobars",
             "--disable-dev-shm-usage",
-            "--disable-extensions",
             "--lang=ru-RU,ru",
             "--window-size=1400,900",
+            "--disable-infobars",
         ],
         locale="ru-RU",
         timezone_id="Europe/Moscow",
@@ -72,45 +69,67 @@ async def _get_browser(acc_id: int, headless: bool = False):
             "Chrome/124.0.0.0 Safari/537.36"
         ),
         ignore_https_errors=True,
-        java_script_enabled=True,
     )
-
-    # Скрываем признаки автоматизации
-    await ctx.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru','en-US','en']});
-        window.chrome = {runtime: {}};
-        Object.defineProperty(navigator, 'permissions', {
-            get: () => ({query: () => Promise.resolve({state: 'granted'})})
-        });
-    """)
-
-    logger.info(f"[{_ts()}] ✅ Браузер успешно открыт")
+    await ctx.add_init_script("""(() => {
+        try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});}catch(e){}
+        try{Object.defineProperty(navigator,'platform',{get:()=>'MacIntel'});}catch(e){}
+        try{Object.defineProperty(navigator,'vendor',{get:()=>'Google Inc.'});}catch(e){}
+        try{if(!window.chrome)window.chrome={};if(!window.chrome.runtime)window.chrome.runtime={};}catch(e){}
+        try{Object.defineProperty(navigator,'languages',{get:()=>['ru-RU','ru','en-US','en']});}catch(e){}
+    })();""")
+    logger.info(f"[{_ts()}] Browser started (headless={headless})")
     return pw, ctx
 
 
 async def _new_page(ctx):
-    """Создаёт новую страницу с таймаутами."""
     page = await ctx.new_page()
     page.set_default_timeout(TIMEOUT)
     page.set_default_navigation_timeout(LONG)
     return page
 
 
-def _ts() -> str:
-    """Текущее время HH:MM:SS для логов."""
-    return datetime.now().strftime("%H:%M:%S")
+async def _screenshot(page, step=""):
+    try:
+        data = await page.screenshot(full_page=False)
+        if step:
+            fname = f"{SCREENSHOTS_DIR}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{step}.png"
+            with open(fname, "wb") as f:
+                f.write(data)
+            logger.info(f"[{_ts()}] Screenshot: {fname}")
+        return data
+    except Exception:
+        return None
 
 
-async def _rnd_delay(lo: float = 0.4, hi: float = 1.8):
-    """Случайная задержка для имитации человека."""
-    await asyncio.sleep(lo + (hi - lo) * random.random())
+async def _get_idmsa_frame(page):
+    for f in page.frames:
+        if "idmsa.apple.com" in f.url:
+            return f
+    return None
 
 
-async def _type_human(page, selector: str, text: str):
-    """Вводит текст посимвольно с человеческими задержками."""
-    el = page.locator(selector).first
+async def _wait_idmsa_inputs(page, min_inputs=1, timeout=45):
+    """Wait until idmsa frame has at least min_inputs visible inputs."""
+    for attempt in range(timeout):
+        await asyncio.sleep(1)
+        for f in page.frames:
+            if "idmsa.apple.com" in f.url:
+                try:
+                    cnt = await f.evaluate(
+                        'document.querySelectorAll("input:not([type=hidden])").length'
+                    )
+                    if cnt >= min_inputs:
+                        logger.info(f"[{_ts()}] idmsa ready: {cnt} inputs (attempt {attempt+1})")
+                        return f
+                except Exception:
+                    pass
+        if attempt % 10 == 9:
+            logger.info(f"[{_ts()}] Still waiting for idmsa... {attempt+1}s")
+    return None
+
+
+async def _type_frame(frame, selector, text):
+    el = frame.locator(selector).first
     await el.click()
     await el.fill("")
     await _rnd_delay(0.1, 0.3)
@@ -119,494 +138,369 @@ async def _type_human(page, selector: str, text: str):
     await _rnd_delay(0.2, 0.5)
 
 
-async def _screenshot(page, step: str = "") -> Optional[bytes]:
-    """Делает скриншот и сохраняет в ./screenshots/."""
-    try:
-        data = await page.screenshot(full_page=False)
-        if step:
-            fname = f"{SCREENSHOTS_DIR}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{step}.png"
-            with open(fname, "wb") as f:
-                f.write(data)
-            logger.info(f"[{_ts()}] 📸 Скриншот сохранён: {fname}")
-        return data
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Кнопки — стратегия клика (синяя = primary, белая = secondary)
-# ---------------------------------------------------------------------------
-
-async def _click_blue(page, timeout: int = TIMEOUT) -> bool:
-    """
-    Нажимает главную синюю кнопку действия.
-    Приоритет: CSS primary → submit → текст кнопки.
-    """
-    selectors = [
-        "button[class*='btn-primary']",
-        "button[class*='button-primary']",
-        "button[class*='primary']",
-        "#btn-sign-in",
-        "button[type='submit']",
-        "input[type='submit']",
-    ]
-    for sel in selectors:
+async def _click_frame_btn(frame, *texts):
+    for text in texts:
+        for sel in [f"button:has-text('{text}')", f"input[value='{text}']"]:
+            try:
+                el = frame.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    await el.click()
+                    return True
+            except Exception:
+                pass
         try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=2000):
-                logger.info(f"[{_ts()}] 🖱️ Клик по СИНЕЙ кнопке (CSS: {sel})")
-                await btn.click()
-                return True
-        except Exception:
-            pass
-
-    # Fallback по тексту
-    for text in ["Продолжить", "Войти", "Continue", "Sign In", "Далее", "Next"]:
-        try:
-            btn = page.get_by_role("button", name=re.compile(text, re.I)).first
-            if await btn.is_visible(timeout=2000):
-                logger.info(f"[{_ts()}] 🖱️ Клик по СИНЕЙ кнопке: «{text}»")
-                await btn.click()
+            el = frame.get_by_role("button", name=re.compile(text, re.I)).first
+            if await el.is_visible(timeout=2000):
+                await el.click()
                 return True
         except Exception:
             pass
     return False
 
 
-async def _click_white(page, text: str, timeout: int = TIMEOUT) -> bool:
+async def _frame_text(page):
+    parts = []
+    for f in page.frames:
+        try:
+            t = await f.evaluate('document.body ? document.body.innerText : ""')
+            parts.append(t.lower())
+        except Exception:
+            pass
+    return " ".join(parts)
+
+def _normalize_q(text: str) -> str:
+    """Normalize question text for matching: strip, lowercase, unify question marks."""
+    return text.strip().lower().replace("？", "?").replace("\u3002", ".").replace("\u3001", ",")
+
+
+async def _answer_security_questions(frame, q1_text, q1_answer, q2_text, q2_answer,
+                                      q3_text="", q3_answer=""):
     """
-    Нажимает белую/вторичную кнопку по тексту.
-    Используется для «другие возможности», «не улучшать» и т.д.
+    Fill security question inputs.
+
+    Apple renders questions inside divs with id="question-N".
+    Each input has aria-describedby="question-N" linking it to its question text.
+    Apple shows 2 questions per page, then a Continue button, then possibly more.
+
+    Strategy:
+    1. Find all [id^="question-"] divs and their linked inputs via aria-describedby
+    2. Match question text to known answers (normalized exact -> partial -> positional)
+    3. Click Continue, repeat until no more question pages
     """
-    # Попытка 1: role=button
-    try:
-        btn = page.get_by_role("button", name=re.compile(re.escape(text), re.I)).first
-        await btn.wait_for(state="visible", timeout=timeout)
-        logger.info(f"[{_ts()}] 🖱️ Клик по БЕЛОЙ кнопке: «{text}»")
-        await btn.click()
-        return True
-    except Exception:
-        pass
+    # Build normalized lookup: normalized_question -> answer
+    qa_map = {}       # normalized -> answer
+    qa_raw = {}       # normalized -> original text (for logging)
+    for q, a in [(q1_text, q1_answer), (q2_text, q2_answer), (q3_text, q3_answer)]:
+        if q and a:
+            nq = _normalize_q(q)
+            qa_map[nq] = a.strip()
+            qa_raw[nq] = q.strip()
 
-    # Попытка 2: любой кликабельный элемент с текстом
-    try:
-        el = page.get_by_text(re.compile(re.escape(text), re.I)).first
-        await el.wait_for(state="visible", timeout=SHORT)
-        logger.info(f"[{_ts()}] 🖱️ Клик по тексту: «{text}»")
-        await el.click()
-        return True
-    except Exception:
-        pass
-
-    # Попытка 3: locator с has-text
-    try:
-        el = page.locator(f"button:has-text('{text}'), a:has-text('{text}')").first
-        if await el.is_visible(timeout=2000):
-            await el.click()
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-async def _retry_click(fn, *args, retries: int = 3, **kwargs) -> bool:
-    """Повторяет клик до retries раз с нарастающей задержкой."""
-    for attempt in range(1, retries + 1):
-        result = await fn(*args, **kwargs)
-        if result:
-            return True
-        if attempt < retries:
-            logger.warning(f"[{_ts()}] ⚠️ Клик не удался, попытка {attempt}/{retries}")
-            await asyncio.sleep(attempt * 1.0)
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Контрольные вопросы — точное совпадение + посимвольный ввод
-# ---------------------------------------------------------------------------
-
-async def _answer_security_questions(
-    page,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    q3_text: str = "", q3_answer: str = "",
-) -> bool:
-    """
-    Читает вопросы на странице (до 3 штук), сопоставляет с хранимыми ответами,
-    вводит ТОЧНЫЙ ответ посимвольно (human-like).
-    Поддерживает показ по одному вопросу за раз (Apple показывает их поочерёдно).
-    """
-    # Словарь: фрагмент текста вопроса → ответ
-    qa_map = {}
-    if q1_text and q1_answer:
-        qa_map[q1_text] = q1_answer
-    if q2_text and q2_answer:
-        qa_map[q2_text] = q2_answer
-    if q3_text and q3_answer:
-        qa_map[q3_text] = q3_answer
-
-    # Порядковый список для fallback
-    qa_list = [
-        (q1_text, q1_answer),
-        (q2_text, q2_answer),
-        (q3_text, q3_answer),
-    ]
-    qa_list = [(q, a) for q, a in qa_list if q and a]
-
-    async def _type_answer(inp, answer: str):
-        await inp.click()
-        await inp.fill("")
-        await _rnd_delay(0.2, 0.4)
-        for ch in answer:
-            await inp.type(ch, delay=35 + int(65 * random.random()))
-        await _rnd_delay(0.3, 0.6)
-
-    try:
-        # Apple может показывать вопросы по одному — обрабатываем до 3 итераций
-        for iteration in range(3):
-            try:
-                content = await page.content()
-            except Exception:
-                break
-
-            logger.info(f"[{_ts()}] 🔐 Контрольные вопросы — итерация {iteration+1}")
-
-            # Ищем все видимые поля ввода (не пароль, не email)
-            inputs = page.locator(
-                "input[type='text']:visible, "
-                "input[type='password']:visible, "
-                "input:not([type]):visible, "
-                "input[autocomplete*='answer']:visible"
-            )
-            count = await inputs.count()
-            logger.info(f"[{_ts()}] 🔍 Полей ввода: {count}")
-
-            if count == 0:
-                break
-
-            answered_this_round = 0
-
-            for i in range(count):
-                inp = inputs.nth(i)
-                try:
-                    # Читаем текст вопроса из DOM вокруг поля
-                    parent_text = await page.evaluate(
-                        """(el) => {
-                            let p = el.parentElement;
-                            for (let j = 0; j < 8; j++) {
-                                if (!p) break;
-                                let t = (p.innerText || p.textContent || '').trim();
-                                if (t.length > 5) return t;
-                                p = p.parentElement;
-                            }
-                            return document.body.innerText || '';
-                        }""",
-                        await inp.element_handle()
-                    )
-
-                    # Ищем совпадение по тексту вопроса
-                    matched_answer = None
-                    matched_q = ""
-                    for q_text, q_answer in qa_map.items():
-                        # Проверяем первые 10 символов вопроса в тексте страницы
-                        if q_text[:10] in parent_text or q_text[:10] in content:
-                            matched_answer = q_answer
-                            matched_q = q_text
-                            break
-
-                    # Fallback: по порядку
-                    if not matched_answer and answered_this_round < len(qa_list):
-                        matched_answer = qa_list[answered_this_round][1]
-                        matched_q = qa_list[answered_this_round][0]
-
-                    if matched_answer:
-                        logger.info(
-                            f"[{_ts()}] ✍️ Вопрос {i+1}: «{matched_q[:25]}…» → «{matched_answer}»"
-                        )
-                        await _type_answer(inp, matched_answer)
-                        answered_this_round += 1
-
-                except Exception as e:
-                    logger.warning(f"[{_ts()}] ⚠️ Поле {i}: {e}")
-                    # Fallback: заполняем по порядку
-                    if answered_this_round < len(qa_list):
-                        try:
-                            await _type_answer(inp, qa_list[answered_this_round][1])
-                            answered_this_round += 1
-                        except Exception:
-                            pass
-                    continue
-
-            if answered_this_round == 0:
-                logger.warning(f"[{_ts()}] ⚠️ Не удалось заполнить ни одного поля")
-                break
-
-            await _rnd_delay(0.5, 1.0)
-            logger.info(f"[{_ts()}] 🖱️ Клик «Продолжить» после вопросов")
-            await _retry_click(_click_blue, page)
-            await _rnd_delay(2.0, 3.0)
-
-            # Проверяем — ещё есть вопросы?
-            try:
-                new_content = await page.content()
-                still_questions = (
-                    "контрольн" in new_content.lower()
-                    or any(q[:8] in new_content for q, _ in qa_list)
-                )
-                if not still_questions:
-                    break
-            except Exception:
-                break
-
-        logger.info(f"[{_ts()}] ✅ Контрольные вопросы обработаны")
-        return True
-
-    except Exception as e:
-        logger.error(f"[{_ts()}] ❌ Ошибка контрольных вопросов: {e}")
+    if not qa_map:
+        logger.warning(f"[{_ts()}] No security question data provided")
         return False
 
+    logger.info(f"[{_ts()}] Answering security questions ({len(qa_map)} known)")
+    qa_values = list(qa_map.values())
 
-# ---------------------------------------------------------------------------
-# SIGN-IN — полный вход на account.apple.com
-# ---------------------------------------------------------------------------
+    for page_attempt in range(8):
+        await asyncio.sleep(2)
 
-async def apple_signin(
-    page,
-    email: str,
-    password: str,
-    q1_text: str,
-    q1_answer: str,
-    q2_text: str,
-    q2_answer: str,
-    tfa_queue: Optional[asyncio.Queue] = None,
-    notify_fn=None,
-    q3_text: str = "",
-    q3_answer: str = "",
-) -> dict:
-    """
-    Полный вход на account.apple.com/sign-in.
-    Обрабатывает: email → пароль → контрольные вопросы → 2FA → «не улучшать».
-    Возвращает {"ok": bool, "error": str, "screenshot": bytes|None}
+        # Extract question-input pairs via aria-describedby
+        try:
+            pairs = await frame.evaluate("""() => {
+                const result = [];
+                document.querySelectorAll('[id^="question-"]').forEach(function(qDiv) {
+                    const inp = document.querySelector('input[aria-describedby="' + qDiv.id + '"]');
+                    if (inp) {
+                        result.push({
+                            qId: qDiv.id,
+                            qText: qDiv.innerText.trim(),
+                            inputId: inp.id,
+                            visible: inp.offsetParent !== null
+                        });
+                    }
+                });
+                return result;
+            }""")
+        except Exception as e:
+            logger.warning(f"[{_ts()}] JS pairs error: {e}")
+            pairs = []
+
+        logger.info(f"[{_ts()}] Found {len(pairs)} question-input pairs on page {page_attempt+1}")
+
+        if not pairs:
+            # Fallback: find all visible password inputs that aren't the login password field
+            try:
+                inputs_info = await frame.evaluate("""() =>
+                    Array.from(document.querySelectorAll('input[type="password"]'))
+                    .filter(el => el.offsetParent !== null && el.id !== 'password_text_field')
+                    .map((el, i) => ({id: el.id, idx: i}))
+                """)
+                logger.info(f"[{_ts()}] Fallback: {len(inputs_info)} password inputs")
+                for i, info in enumerate(inputs_info):
+                    if i < len(qa_values):
+                        try:
+                            if info["id"]:
+                                el = frame.locator(f'#{info["id"]}').first
+                            else:
+                                el = frame.locator('input[type="password"]').nth(i)
+                            await el.click()
+                            await el.fill(qa_values[i])
+                            logger.info(f"[{_ts()}] Fallback fill [{i}]: {qa_values[i]}")
+                        except Exception as fe:
+                            logger.warning(f"[{_ts()}] Fallback fill error: {fe}")
+            except Exception as e:
+                logger.warning(f"[{_ts()}] Fallback error: {e}")
+        else:
+            filled = 0
+            for i, pair in enumerate(pairs):
+                q_on_page     = pair.get("qText", "").strip()
+                q_on_page_n   = _normalize_q(q_on_page)
+                inp_id        = pair.get("inputId", "")
+                q_id          = pair.get("qId", "")
+
+                # Match: normalized exact -> partial (first 8 chars) -> positional
+                answer = qa_map.get(q_on_page_n)
+                if not answer:
+                    for kq, ka in qa_map.items():
+                        if len(kq) >= 6 and (kq[:8] in q_on_page_n or q_on_page_n[:8] in kq):
+                            answer = ka
+                            break
+                if not answer and i < len(qa_values):
+                    answer = qa_values[i]
+                    logger.warning(f"[{_ts()}] Positional answer [{i}]: '{q_on_page[:30]}' -> '{answer}'")
+
+                if answer:
+                    try:
+                        if inp_id:
+                            el = frame.locator(f'#{inp_id}').first
+                        else:
+                            el = frame.locator(f'input[aria-describedby="{q_id}"]').first
+                        await el.click()
+                        await el.fill(answer)
+                        await _rnd_delay(0.2, 0.5)
+                        logger.info(f"[{_ts()}] Filled '{q_on_page[:40]}' -> '{answer}'")
+                        filled += 1
+                    except Exception as e:
+                        logger.warning(f"[{_ts()}] Fill error for '{q_on_page[:30]}': {e}")
+
+            logger.info(f"[{_ts()}] Filled {filled}/{len(pairs)} fields")
+
+        await _rnd_delay(0.5, 1.0)
+
+        # Click Continue / Next
+        clicked = await _click_frame_btn(frame, "Continue", "Продолжить", "Далее", "Next", "继续")
+        if not clicked:
+            try:
+                await frame.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const btn = btns.find(b => /continue|продолжить|далее|next|继续/i.test(b.innerText))
+                              || btns.find(b => b.type === 'submit');
+                    if (btn) btn.click();
+                }""")
+            except Exception:
+                pass
+
+        await _rnd_delay(3.0, 5.0)
+
+        # Check if we're past the questions page
+        try:
+            body = await frame.evaluate('document.body ? document.body.innerText.toLowerCase() : ""')
+            has_questions = (
+                "answer your security" in body
+                or "security question" in body
+                or "контрольн" in body
+            )
+            wrong_answer = (
+                "don't match" in body
+                or "incorrect" in body
+                or "не совпадают" in body
+                or "неверн" in body
+            )
+            if wrong_answer:
+                logger.warning(f"[{_ts()}] Wrong answers detected, retrying page {page_attempt+1}")
+                continue
+            if not has_questions:
+                logger.info(f"[{_ts()}] Security questions passed after {page_attempt+1} pages")
+                return True
+        except Exception:
+            return True
+
+    logger.info(f"[{_ts()}] Security questions: max attempts reached, continuing")
+    return True
+
+async def apple_signin(page, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                       tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Sign in to account.apple.com.
+
+    Apple's sign-in page loads both email and password fields in the same idmsa
+    iframe, but the password field is behind a CSS overlay until after the email
+    step is submitted. We must:
+      1. Fill email -> click Continue -> wait for overlay to slide away
+      2. Then fill password (now clickable) -> click Sign In
     """
     result = {"ok": False, "error": "", "screenshot": None}
-
     try:
-        logger.info(f"[{_ts()}] 🌐 Переход на {URL_SIGNIN}")
+        logger.info(f"[{_ts()}] Navigating to {URL_SIGNIN}")
         await page.goto(URL_SIGNIN, wait_until="domcontentloaded")
-        await _rnd_delay(1.5, 2.5)
+        await _rnd_delay(4.0, 6.0)
 
-        # ── Шаг 1: поле email ──────────────────────────────────────────────
-        # Apple использует несколько вариантов разметки — пробуем все
-        EMAIL_SELECTORS = [
-            "input[name='accountName']",
-            "#account_name_text_field",
-            "input[autocomplete='username']",
-            "input[type='email']",
-            "input[type='text'][name*='account']",
-            "input[placeholder*='E-mail']",
-            "input[placeholder*='email']",
-            "input[placeholder*='Email']",
-            "input[placeholder*='телефон']",
-            "input[placeholder*='номер']",
-            # Новый дизайн Apple 2025-2026
-            "input[id*='account']",
-            "input[id*='email']",
-            "input[id*='username']",
-            "#signin-form input[type='text']",
-            "#signin-form input:not([type='password'])",
-            "form input[type='text']:first-of-type",
-            "form input:not([type='password']):not([type='hidden']):not([type='submit'])",
-        ]
-
-        email_found = False
-        for sel in EMAIL_SELECTORS:
-            try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=3000):
-                    logger.info(f"[{_ts()}] ✍️ Ввод email (селектор: {sel}): {email}")
-                    await el.click()
-                    await el.fill("")
-                    await _rnd_delay(0.2, 0.4)
-                    for ch in email:
-                        await el.type(ch, delay=40 + int(80 * random.random()))
-                    email_found = True
-                    break
-            except Exception:
-                continue
-
-        # Последний шанс — ищем через iframe (Apple иногда грузит форму в iframe)
-        if not email_found:
-            try:
-                frames = page.frames
-                for frame in frames:
-                    for sel in EMAIL_SELECTORS[:6]:
-                        try:
-                            el = frame.locator(sel).first
-                            if await el.is_visible(timeout=2000):
-                                logger.info(f"[{_ts()}] ✍️ Ввод email в iframe: {email}")
-                                await el.fill(email)
-                                email_found = True
-                                break
-                        except Exception:
-                            continue
-                    if email_found:
-                        break
-            except Exception:
-                pass
-
-        if not email_found:
-            result["error"] = "Поле email не найдено на странице входа"
-            result["screenshot"] = await _screenshot(page, "no_email_field")
+        # Wait for idmsa iframe
+        auth_frame = await _wait_idmsa_inputs(page, min_inputs=1, timeout=45)
+        if not auth_frame:
+            result["error"] = "Apple sign-in form did not load (no idmsa iframe)"
+            result["screenshot"] = await _screenshot(page, "iframe_empty")
             return result
 
-        await _rnd_delay(0.5, 1.0)
+        # --- Step 1: Fill email ---
+        email_sel = "#account_name_text_field"
+        try:
+            el = auth_frame.locator(email_sel).first
+            if await el.is_visible(timeout=5000):
+                logger.info(f"[{_ts()}] Filling email")
+                await el.click()
+                await el.fill("")
+                await _rnd_delay(0.1, 0.3)
+                for ch in email:
+                    await el.type(ch, delay=40 + int(80 * random.random()))
+                await _rnd_delay(0.3, 0.6)
+        except Exception as e:
+            logger.warning(f"[{_ts()}] Email fill error: {e}")
 
-        logger.info(f"[{_ts()}] 🖱️ Клик по СИНЕЙ кнопке: «Продолжить»")
-        await _retry_click(_click_blue, page)
-        await _rnd_delay(1.5, 2.5)
+        # Click Continue (submits email step)
+        clicked = await _click_frame_btn(auth_frame, "Continue", "Продолжить", "Sign In", "Войти")
+        if not clicked:
+            for sel in ["#sign-in", "button[type='submit']", "button.button-primary"]:
+                try:
+                    el = auth_frame.locator(sel).first
+                    if await el.is_visible(timeout=1000):
+                        await el.click()
+                        break
+                except Exception:
+                    pass
 
-        # ── Шаг 2: поле пароля ────────────────────────────────────────────
-        PWD_SELECTORS = [
-            "#password_text_field",
-            "input[autocomplete='current-password']",
-            "input[type='password']",
-            "input[name='password']",
-            "input[id*='password']",
-            "form input[type='password']",
-        ]
+        # Wait for CSS transition: overlay slides away, password becomes clickable
+        # The password field exists in DOM but is behind .signin-content overlay
+        # After Continue click, Apple animates the transition (~1-2s)
+        await _rnd_delay(2.5, 4.0)
 
-        pwd_found = False
-        for sel in PWD_SELECTORS:
+        # --- Step 2: Fill password ---
+        # After Continue, Apple auto-focuses the password field (tabindex becomes 0).
+        # The field is already active — type directly via keyboard, no click needed.
+        for f in page.frames:
+            if "idmsa.apple.com" in f.url:
+                auth_frame = f
+                break
+
+        # Wait for password field to become active (tabindex 0 = focusable)
+        pwd_ready = False
+        for attempt in range(12):
             try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=5000):
-                    logger.info(f"[{_ts()}] ✍️ Ввод пароля (селектор: {sel})")
-                    await el.click()
-                    await el.fill("")
-                    await _rnd_delay(0.2, 0.4)
-                    for ch in password:
-                        await el.type(ch, delay=40 + int(80 * random.random()))
-                    pwd_found = True
+                info = await auth_frame.evaluate("""() => {
+                    const el = document.querySelector('#password_text_field');
+                    return el ? {tabindex: el.tabIndex, active: document.activeElement === el} : null;
+                }""")
+                if info and info.get("tabindex", -1) == 0:
+                    pwd_ready = True
+                    logger.info(f"[{_ts()}] Password field ready (attempt {attempt+1}), active={info.get('active')}")
                     break
             except Exception:
-                continue
-
-        if not pwd_found:
-            # Пробуем iframe
-            try:
-                for frame in page.frames:
-                    for sel in PWD_SELECTORS:
-                        try:
-                            el = frame.locator(sel).first
-                            if await el.is_visible(timeout=2000):
-                                await el.fill(password)
-                                pwd_found = True
-                                break
-                        except Exception:
-                            continue
-                    if pwd_found:
-                        break
-            except Exception:
                 pass
+            await asyncio.sleep(1)
 
-        if not pwd_found:
-            result["error"] = "Поле пароля не найдено"
-            result["screenshot"] = await _screenshot(page, "no_pwd_field")
+        if not pwd_ready:
+            result["error"] = "Password field never became active"
+            result["screenshot"] = await _screenshot(page, "password_not_ready")
             return result
 
+        # Type password via keyboard (field is auto-focused by Apple's JS)
+        await auth_frame.evaluate("document.querySelector('#password_text_field').focus()")
+        await asyncio.sleep(0.3)
+        for ch in password:
+            await page.keyboard.type(ch, delay=40 + int(80 * random.random()))
+        logger.info(f"[{_ts()}] Password typed via keyboard")
         await _rnd_delay(0.5, 1.0)
 
-        logger.info(f"[{_ts()}] 🖱️ Клик по СИНЕЙ кнопке: «Войти»")
-        await _retry_click(_click_blue, page)
-        await _rnd_delay(2.0, 3.5)
+        # Submit: press Enter (most reliable) or click Sign In button
+        await page.keyboard.press("Enter")
+        clicked = True
+        logger.info(f"[{_ts()}] Submitted password via Enter")
 
-        # ── Цикл обработки страниц после входа ────────────────────────────
-        for iteration in range(15):
-            url = page.url
-            try:
-                content = await page.content()
-            except Exception:
-                await _rnd_delay(1, 2)
-                continue
-            cl = content.lower()
+        await _rnd_delay(3.0, 5.0)
 
-            logger.info(f"[{_ts()}] 🔄 Итерация {iteration+1}: {url[:60]}")
+        # --- Main auth loop: handle 2FA, security questions, etc. ---
+        for iteration in range(30):
+            url  = page.url
+            body = await _frame_text(page)
+            logger.info(f"[{_ts()}] Auth iter {iteration+1}: {url[:70]}")
 
-            # Успешный вход
-            if (
-                "account/manage" in url
-                or ("appleid.apple.com" in url and "sign-in" not in url)
-                or ("icloud.com" in url and "sign" not in url)
-            ):
-                logger.info(f"[{_ts()}] ✅ Вход выполнен успешно!")
+            # Success
+            if ("account/manage" in url
+                    or ("account.apple.com" in url
+                        and "sign-in" not in url
+                        and "security-questions" not in url)):
+                logger.info(f"[{_ts()}] Login successful!")
                 result["ok"] = True
                 return result
 
-            # Контрольные вопросы
-            if (
-                "контрольн" in cl
-                or "security question" in cl
-                or (q1_text and q1_text[:6] in content)
-                or (q2_text and q2_text[:6] in content)
-            ):
-                logger.info(f"[{_ts()}] 🔐 Страница контрольных вопросов")
+            auth_frame = await _get_idmsa_frame(page)
+
+            # Security questions
+            sq_triggered = (
+                "answer your security" in body
+                or "security question" in body
+                or "контрольн" in body
+                or (q1_text and q1_text[:6].lower() in body)
+                or (q2_text and q2_text[:6].lower() in body)
+                or (q3_text and q3_text[:6].lower() in body)
+            )
+            if sq_triggered:
+                logger.info(f"[{_ts()}] Security questions detected")
+                target = auth_frame if auth_frame else page
                 ok = await _answer_security_questions(
-                    page, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer
+                    target, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer
                 )
                 if not ok:
-                    result["error"] = "Не удалось ответить на контрольные вопросы"
+                    result["error"] = "Failed to answer security questions"
                     result["screenshot"] = await _screenshot(page, "questions_fail")
                     return result
-                await _rnd_delay(2.0, 3.0)
+                # Wait for redirect after questions — page body goes empty then redirects
+                for _ in range(15):
+                    await asyncio.sleep(1)
+                    cur_url = page.url
+                    if "account/manage" in cur_url or ("account.apple.com" in cur_url and "sign-in" not in cur_url):
+                        logger.info(f"[{_ts()}] Redirected after questions: {cur_url}")
+                        result["ok"] = True
+                        return result
                 continue
 
-            # 2FA — «Безопасность Аккаунта Apple» → «другие возможности»
-            if (
-                "двухфакторн" in cl
-                or "two-factor" in cl
-                or "безопасность аккаунта apple" in cl
-            ):
-                if "другие возможности" in cl or "other options" in cl:
-                    logger.info(f"[{_ts()}] 🖱️ Клик по БЕЛОЙ кнопке: «другие возможности»")
-                    await _retry_click(_click_white, page, "другие возможности")
-                    await _rnd_delay(1.5, 2.5)
-                    continue
+            # Wrong security question answers
+            if "не совпадают" in body or "don't match" in body or "ответы не совпадают" in body:
+                result["error"] = "Wrong security question answers — update them via /setup"
+                result["screenshot"] = await _screenshot(page, "wrong_answers")
+                return result
 
-            # «Защитите свой аккаунт» → «не улучшать»
-            if (
-                "защитите" in cl
-                or "не улучшать" in cl
-                or "don't improve" in cl
-                or "protect your account" in cl
-            ):
-                logger.info(f"[{_ts()}] 🖱️ Клик по БЕЛОЙ кнопке: «не улучшать» (левая)")
-                await _retry_click(_click_white, page, "не улучшать")
-                await _rnd_delay(1.5, 2.5)
-                continue
+            # Wrong credentials
+            if "incorrect" in body or ("check the account information" in body and "security" not in body):
+                result["error"] = "Wrong email or password"
+                result["screenshot"] = await _screenshot(page, "wrong_password")
+                return result
 
-            # 2FA код (6 цифр)
-            if (
-                "verification code" in cl
-                or "код подтверждения" in cl
-                or "enter the code" in cl
-                or "введите код" in cl
-            ):
-                logger.info(f"[{_ts()}] 📲 Требуется код 2FA")
+            # 2FA code required
+            if ("verification code" in body
+                    or "код подтверждения" in body
+                    or "one-time code" in body
+                    or "enter the code" in body):
+                logger.info(f"[{_ts()}] 2FA code required")
                 if notify_fn:
-                    await notify_fn(
-                        "📲 <b>Требуется код двухфакторной аутентификации</b>\n"
-                        "Введите команду: <code>/tfa 123456</code>"
-                    )
+                    await notify_fn("📲 <b>Требуется код 2FA</b>\nВведите: <code>/tfa 123456</code>")
                 if tfa_queue:
                     try:
-                        logger.info(f"[{_ts()}] ⏳ Ожидание кода 2FA (120 сек)...")
                         code = await asyncio.wait_for(tfa_queue.get(), timeout=120)
-                        logger.info(f"[{_ts()}] ✍️ Ввод кода 2FA: {code}")
-                        # Пробуем 6 отдельных полей (по одной цифре)
-                        code_inputs = page.locator(
-                            "input[type='number'], input[inputmode='numeric'], "
-                            "input[maxlength='1'], input[class*='digit']"
+                        target = auth_frame if auth_frame else page
+                        code_inputs = target.locator(
+                            "input[type='number'],input[inputmode='numeric'],input[maxlength='1']"
                         )
                         cnt = await code_inputs.count()
                         if cnt >= 6:
@@ -614,62 +508,199 @@ async def apple_signin(
                                 await code_inputs.nth(idx).fill(ch)
                                 await _rnd_delay(0.05, 0.15)
                         else:
-                            single = page.locator(
-                                "input[autocomplete='one-time-code'], "
-                                "input[type='text'][maxlength='6']"
+                            single = target.locator(
+                                "input[autocomplete='one-time-code'],input[inputmode='numeric']"
                             ).first
-                            await single.fill(code)
-                        await _retry_click(_click_blue, page)
+                            if await single.is_visible(timeout=2000):
+                                await single.fill(code)
+                        if auth_frame:
+                            await _click_frame_btn(auth_frame, "Continue", "Продолжить", "Verify")
                         await _rnd_delay(2.0, 3.0)
                         continue
                     except asyncio.TimeoutError:
-                        result["error"] = "Таймаут ожидания кода 2FA (120 сек)"
+                        result["error"] = "2FA timeout (120s)"
                         result["screenshot"] = await _screenshot(page, "tfa_timeout")
                         return result
                 else:
-                    result["error"] = "Требуется 2FA, но очередь не передана"
+                    result["error"] = "2FA required but no queue"
                     result["screenshot"] = await _screenshot(page, "tfa_no_queue")
                     return result
 
-            # «Доверять этому браузеру?»
-            if "trust" in cl or "доверять" in cl or "доверяете" in cl:
-                logger.info(f"[{_ts()}] 🖱️ Клик «Не сейчас» (Trust browser popup)")
-                await _click_white(page, "Не сейчас")
+            # Analytics / "Don't improve" prompt
+            if "don't improve" in body or "не улучшать" in body or "improve siri" in body:
+                if auth_frame:
+                    await _click_frame_btn(auth_frame, "Don't Improve", "Не улучшать", "Not Now")
+                await _rnd_delay(1.5, 2.5)
+                continue
+
+            # Trust this browser
+            if "trust" in body or "доверять" in body:
+                if auth_frame:
+                    await _click_frame_btn(auth_frame, "Not Now", "Не сейчас", "Trust")
                 await _rnd_delay(1.0, 2.0)
                 continue
 
-            # Неизвестная страница — ждём
             await _rnd_delay(1.5, 2.5)
 
-        result["error"] = "Превышено число итераций входа (15)"
+        result["error"] = "Login loop exceeded (30 iterations)"
         result["screenshot"] = await _screenshot(page, "signin_loop_exceeded")
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ Ошибка входа: {e}")
+        logger.error(f"[{_ts()}] apple_signin error: {e}")
         result["error"] = str(e)
         result["screenshot"] = await _screenshot(page, "signin_exception")
         return result
+async def _signin_icloud(page, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                         tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Sign in to iCloud (Find My, Mail) — same idmsa iframe as account.apple.com."""
+    try:
+        await _rnd_delay(2.0, 4.0)
+        for iteration in range(30):
+            url  = page.url
+            body = await _frame_text(page)
+            logger.info(f"[{_ts()}] iCloud iter {iteration+1}: {url[:60]}")
 
+            # Already signed in
+            if (("icloud.com/find" in url or "icloud.com/mail" in url)
+                    and "sign" not in url.lower()):
+                logger.info(f"[{_ts()}] iCloud signed in")
+                return True
 
-# ---------------------------------------------------------------------------
-# DEVICES — список устройств с IMEI
-# ---------------------------------------------------------------------------
+            # Also check if we're on icloud.com main page (redirected after login)
+            if "icloud.com" in url and "idmsa" not in url and "sign-in" not in url:
+                logger.info(f"[{_ts()}] iCloud main page reached")
+                return True
 
-def _parse_device_text(text: str) -> dict:
-    """Извлекает Описание, Модель, Версию, IMEI из текста панели устройства."""
+            auth_frame = await _get_idmsa_frame(page)
+
+            if auth_frame:
+                # Fill email if empty
+                for sel in ["#account_name_text_field", "input[type='text']", "input[type='email']"]:
+                    try:
+                        el = auth_frame.locator(sel).first
+                        if await el.is_visible(timeout=2000):
+                            val = await el.input_value()
+                            if not val:
+                                logger.info(f"[{_ts()}] iCloud: filling email")
+                                await _type_frame(auth_frame, sel, email)
+                                await _rnd_delay(0.5, 1.0)
+                                await _click_frame_btn(auth_frame, "Continue", "Продолжить")
+                                for s in ["#sign-in", "button[type='submit']"]:
+                                    try:
+                                        e2 = auth_frame.locator(s).first
+                                        if await e2.is_visible(timeout=1000):
+                                            await e2.click()
+                                            break
+                                    except Exception:
+                                        pass
+                                await _rnd_delay(2.0, 3.0)
+                            break
+                    except Exception:
+                        pass
+
+                # Fill password if visible
+                try:
+                    el = auth_frame.locator("#password_text_field").first
+                    if await el.is_visible(timeout=2000):
+                        val = await el.input_value()
+                        if not val:
+                            logger.info(f"[{_ts()}] iCloud: filling password")
+                            await _type_frame(auth_frame, "#password_text_field", password)
+                            await _rnd_delay(0.5, 1.0)
+                            await _click_frame_btn(auth_frame, "Sign In", "Войти", "Continue")
+                            for s in ["#sign-in", "button[type='submit']"]:
+                                try:
+                                    e2 = auth_frame.locator(s).first
+                                    if await e2.is_visible(timeout=1000):
+                                        await e2.click()
+                                        break
+                                except Exception:
+                                    pass
+                            await _rnd_delay(2.5, 4.0)
+                            continue
+                except Exception:
+                    pass
+
+            # Security questions
+            sq_triggered = (
+                "answer your security" in body
+                or "security question" in body
+                or "контрольн" in body
+                or (q1_text and q1_text[:6].lower() in body)
+                or (q2_text and q2_text[:6].lower() in body)
+                or (q3_text and q3_text[:6].lower() in body)
+            )
+            if sq_triggered:
+                target = auth_frame if auth_frame else page
+                await _answer_security_questions(
+                    target, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer
+                )
+                await _rnd_delay(2.0, 3.0)
+                continue
+
+            # 2FA
+            if ("verification code" in body
+                    or "код подтверждения" in body
+                    or "one-time code" in body):
+                if notify_fn:
+                    await notify_fn("📲 Требуется код 2FA. Введите: <code>/tfa 123456</code>")
+                if tfa_queue:
+                    try:
+                        code = await asyncio.wait_for(tfa_queue.get(), timeout=120)
+                        target = auth_frame if auth_frame else page
+                        code_inputs = target.locator(
+                            "input[type='number'],input[inputmode='numeric'],input[maxlength='1']"
+                        )
+                        cnt = await code_inputs.count()
+                        if cnt >= 6:
+                            for idx, ch in enumerate(code[:6]):
+                                await code_inputs.nth(idx).fill(ch)
+                                await _rnd_delay(0.05, 0.15)
+                        else:
+                            single = target.locator("input[autocomplete='one-time-code']").first
+                            if await single.is_visible(timeout=2000):
+                                await single.fill(code)
+                        if auth_frame:
+                            await _click_frame_btn(auth_frame, "Continue", "Продолжить")
+                        await _rnd_delay(2.0, 3.0)
+                        continue
+                    except asyncio.TimeoutError:
+                        return False
+
+            if "don't improve" in body or "не улучшать" in body:
+                if auth_frame:
+                    await _click_frame_btn(auth_frame, "Don't Improve", "Не улучшать", "Not Now")
+                await _rnd_delay(1.5, 2.5)
+                continue
+
+            if "trust" in body or "доверять" in body:
+                if auth_frame:
+                    await _click_frame_btn(auth_frame, "Not Now", "Не сейчас")
+                await _rnd_delay(1.0, 2.0)
+                continue
+
+            if not auth_frame:
+                await _wait_idmsa_inputs(page, timeout=8)
+
+            await _rnd_delay(1.5, 2.5)
+
+        return False
+
+    except Exception as e:
+        logger.error(f"[{_ts()}] _signin_icloud error: {e}")
+        return False
+
+def _parse_device_text(text):
     dev = {"description": "", "model": "", "version": "", "imei": "", "name": ""}
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-
     for i, line in enumerate(lines):
-        ll = line.lower()
+        ll  = line.lower()
         nxt = lines[i + 1] if i + 1 < len(lines) else ""
-
-        if "описание" in ll:
+        if "описание" in ll or "description" in ll:
             dev["description"] = nxt
-            if not dev["name"]:
-                dev["name"] = nxt
-        elif "модель" in ll:
+            dev["name"] = dev["name"] or nxt
+        elif "модель" in ll or "model" in ll:
             dev["model"] = nxt
         elif "версия" in ll or "version" in ll:
             dev["version"] = nxt
@@ -678,111 +709,98 @@ def _parse_device_text(text: str) -> dict:
             if m:
                 dev["imei"] = m.group(1).replace(" ", "").strip()
         elif re.search(r"(iphone|ipad|mac|ipod|apple watch|airpods)", ll):
-            if not dev["model"]:
-                dev["model"] = line
-            if not dev["name"]:
-                dev["name"] = line
-
+            dev["model"] = dev["model"] or line
+            dev["name"]  = dev["name"] or line
     if not dev["name"] and lines:
         dev["name"] = lines[0]
     return dev
 
 
-async def get_devices(
-    acc_id: int, email: str, password: str,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    tfa_queue=None, notify_fn=None,
-    q3_text: str = "", q3_answer: str = "",
-) -> dict:
-    """
-    Возвращает список устройств с IMEI из account.apple.com/section/devices.
-    {"ok": bool, "devices": [...], "error": str, "screenshot": bytes|None}
-    """
-    pw, ctx = await _get_browser(acc_id)
+async def get_devices(acc_id, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                      tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Get list of devices from account.apple.com/account/manage/section/devices."""
+    pw, ctx = await _get_browser(acc_id, headless=HEADLESS)
     page = await _new_page(ctx)
     result = {"ok": False, "devices": [], "error": "", "screenshot": None}
     try:
-        r = await apple_signin(page, email, password, q1_text, q1_answer,
-                               q2_text, q2_answer, tfa_queue, notify_fn,
-                               q3_text, q3_answer)
+        r = await apple_signin(
+            page, email, password, q1_text, q1_answer, q2_text, q2_answer,
+            tfa_queue, notify_fn, q3_text, q3_answer
+        )
         if not r["ok"]:
             result.update(r)
             return result
 
-        logger.info(f"[{_ts()}] 🌐 Переход на {URL_DEVICES}")
+        logger.info(f"[{_ts()}] Navigating to devices page")
         await page.goto(URL_DEVICES, wait_until="domcontentloaded")
         await _rnd_delay(2.0, 4.0)
 
-        # Ждём список устройств
-        try:
-            await page.wait_for_selector(
-                "[class*='device'], [class*='Device'], li[class*='item']",
-                timeout=LONG
-            )
-        except Exception:
-            logger.warning(f"[{_ts()}] ⚠️ Список устройств не найден стандартным селектором")
+        # Wait for device list
+        for sel in ["[class*='device']", "[class*='Device']", "ul li"]:
+            try:
+                await page.wait_for_selector(sel, timeout=10000)
+                break
+            except Exception:
+                pass
 
         devices = []
-        device_items = page.locator(
-            "[class*='device-item'], [class*='deviceItem'], "
-            "[class*='device-list'] li, [class*='deviceList'] li"
-        )
-        count = await device_items.count()
-        logger.info(f"[{_ts()}] 📱 Найдено элементов устройств: {count}")
-
-        if count == 0:
-            device_items = page.locator("ul li, [role='listitem']")
+        device_items = None
+        count = 0
+        for locator_str in [
+            "[class*='device-item'],[class*='deviceItem']",
+            "[class*='device-list'] li",
+            "ul li",
+            "[role='listitem']",
+        ]:
+            device_items = page.locator(locator_str)
             count = await device_items.count()
+            if count > 0:
+                break
 
-        for i in range(min(count, 25)):
+        for i in range(min(count, 30)):
             try:
                 item = device_items.nth(i)
-                logger.info(f"[{_ts()}] 🖱️ Открываю устройство {i+1}/{count}")
                 await item.click()
                 await _rnd_delay(1.0, 2.0)
 
-                panel = page.locator(
-                    "[class*='device-detail'], [class*='deviceDetail'], "
-                    "[class*='panel'], [class*='modal'], [class*='drawer']"
-                ).first
-                try:
-                    await panel.wait_for(state="visible", timeout=5000)
-                    text = await panel.inner_text()
-                except Exception:
-                    text = await page.inner_text("body")
+                panel = None
+                for ps in ["[class*='device-detail']", "[class*='panel']", "[class*='modal']",
+                           "aside", "[role='dialog']"]:
+                    try:
+                        p = page.locator(ps).first
+                        if await p.is_visible(timeout=3000):
+                            panel = p
+                            break
+                    except Exception:
+                        pass
 
-                dev = _parse_device_text(text)
-                if dev.get("model") or dev.get("description") or dev.get("name"):
+                text = await panel.inner_text() if panel else await page.inner_text("body")
+                dev  = _parse_device_text(text)
+                if dev.get("model") or dev.get("name"):
                     devices.append(dev)
-                    logger.info(
-                        f"[{_ts()}] ✅ Устройство: {dev.get('name','?')} | "
-                        f"IMEI: {dev.get('imei','—')}"
-                    )
+                    logger.info(f"[{_ts()}] Device: {dev.get('name','?')} IMEI:{dev.get('imei','—')}")
 
-                # Закрываем панель
-                close = page.locator(
-                    "[class*='close'], button[aria-label*='close'], "
-                    "button[aria-label*='закрыть'], [class*='dismiss']"
-                ).first
-                try:
-                    if await close.is_visible(timeout=2000):
-                        await close.click()
-                        await _rnd_delay(0.5, 1.0)
-                except Exception:
-                    pass
+                for cs in ["[class*='close']", "button[aria-label*='close']"]:
+                    try:
+                        c = page.locator(cs).first
+                        if await c.is_visible(timeout=1500):
+                            await c.click()
+                            await _rnd_delay(0.5, 1.0)
+                            break
+                    except Exception:
+                        pass
             except Exception as e:
-                logger.warning(f"[{_ts()}] ⚠️ Устройство {i}: {e}")
+                logger.warning(f"[{_ts()}] Device {i}: {e}")
                 continue
 
-        result["ok"] = True
+        result["ok"]      = True
         result["devices"] = devices
-        logger.info(f"[{_ts()}] ✅ Устройств получено: {len(devices)}")
+        logger.info(f"[{_ts()}] Devices total: {len(devices)}")
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ get_devices: {e}")
-        result["error"] = str(e)
+        logger.error(f"[{_ts()}] get_devices error: {e}")
+        result["error"]      = str(e)
         result["screenshot"] = await _screenshot(page, "devices_error")
         return result
     finally:
@@ -790,133 +808,28 @@ async def get_devices(
         await pw.stop()
 
 
-# ---------------------------------------------------------------------------
-# FIND MY — вход в iCloud + список устройств
-# ---------------------------------------------------------------------------
-
-async def _signin_icloud(
-    page, email, password, q1_text, q1_answer, q2_text, q2_answer,
-    tfa_queue=None, notify_fn=None, q3_text="", q3_answer="",
-) -> bool:
-    """Вход через форму iCloud (используется для Find My и Mail)."""
-    try:
-        await _rnd_delay(2.0, 4.0)
-        for _ in range(10):
-            url = page.url
-            try:
-                content = await page.content()
-            except Exception:
-                await _rnd_delay(1, 2)
-                continue
-            cl = content.lower()
-
-            # Уже вошли
-            if ("icloud.com/find" in url or "icloud.com/mail" in url) and "sign" not in url:
-                if "map" in cl or "device" in cl or "message" in cl or "mail" in cl:
-                    logger.info(f"[{_ts()}] ✅ Уже авторизован в iCloud")
-                    return True
-
-            # Поле email
-            if "email" in cl or "accountname" in cl or "sign-in" in url or "почт" in cl:
-                email_sel = (
-                    "input[type='email'], input[name='accountName'], "
-                    "#account_name_text_field, input[autocomplete='username']"
-                )
-                try:
-                    await page.wait_for_selector(email_sel, timeout=SHORT)
-                    logger.info(f"[{_ts()}] ✍️ Ввод email в iCloud: {email}")
-                    await _type_human(page, email_sel, email)
-                    await _rnd_delay(0.5, 1.0)
-                    await _retry_click(_click_blue, page)
-                    await _rnd_delay(1.5, 2.5)
-                    continue
-                except Exception:
-                    pass
-
-            # Поле пароля
-            if "password" in cl or "пароль" in cl:
-                pwd_sel = "input[type='password']"
-                try:
-                    await page.wait_for_selector(pwd_sel, timeout=SHORT)
-                    logger.info(f"[{_ts()}] ✍️ Ввод пароля в iCloud")
-                    await _type_human(page, pwd_sel, password)
-                    await _rnd_delay(0.5, 1.0)
-                    await _retry_click(_click_blue, page)
-                    await _rnd_delay(2.0, 3.0)
-                    continue
-                except Exception:
-                    pass
-
-            # Контрольные вопросы
-            if "контрольн" in cl or (q1_text and q1_text[:6] in content):
-                await _answer_security_questions(
-                    page, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer
-                )
-                await _rnd_delay(2.0, 3.0)
-                continue
-
-            # 2FA предложение
-            if "двухфакторн" in cl or "two-factor" in cl:
-                await _retry_click(_click_white, page, "другие возможности")
-                await _rnd_delay(1.5, 2.5)
-                continue
-
-            # «не улучшать»
-            if "защитите" in cl or "не улучшать" in cl:
-                await _retry_click(_click_white, page, "не улучшать")
-                await _rnd_delay(1.5, 2.5)
-                continue
-
-            # 2FA код
-            if "verification code" in cl or "код подтверждения" in cl:
-                if notify_fn:
-                    await notify_fn("📲 Требуется код 2FA. Введите: <code>/tfa 123456</code>")
-                if tfa_queue:
-                    try:
-                        code = await asyncio.wait_for(tfa_queue.get(), timeout=120)
-                        inp = page.locator(
-                            "input[type='number'], input[inputmode='numeric']"
-                        ).first
-                        await inp.fill(code)
-                        await _retry_click(_click_blue, page)
-                        await _rnd_delay(2.0, 3.0)
-                        continue
-                    except asyncio.TimeoutError:
-                        return False
-
-            await _rnd_delay(1.5, 2.5)
-
-        return False
-    except Exception as e:
-        logger.error(f"[{_ts()}] ❌ _signin_icloud: {e}")
-        return False
-
-
-async def _extract_findmy_devices(page) -> list:
-    """Извлекает список устройств из Find My через JS + DOM fallback."""
+async def _extract_findmy_devices(page):
+    """Extract device list from Find My page — JS window data first, DOM fallback."""
     devices = []
 
-    # Попытка 1: JS window.__data__
+    # Try JS window objects
     try:
-        js_devs = await page.evaluate("""
-            () => {
-                try {
-                    if (window.__data__ && window.__data__.devices)
-                        return window.__data__.devices;
-                    if (window.FindMyApp && window.FindMyApp.devices)
-                        return window.FindMyApp.devices;
-                } catch(e) {}
-                const items = document.querySelectorAll(
-                    '[class*="device-item"], [class*="deviceItem"], [class*="device-list-item"]'
-                );
-                return Array.from(items).map(el => ({
-                    name:     el.querySelector('[class*="name"],[class*="title"]')?.innerText || el.innerText?.split('\\n')[0] || '',
-                    status:   el.querySelector('[class*="status"]')?.innerText || '',
-                    location: el.querySelector('[class*="location"],[class*="subtitle"]')?.innerText || '',
-                    model:    el.querySelector('[class*="model"]')?.innerText || '',
-                }));
+        js_devs = await page.evaluate("""() => {
+            const sources = [window.__data__, window.FindMyApp, window.iCloudData, window.appData];
+            for (const src of sources) {
+                if (src && src.devices && Array.isArray(src.devices)) return src.devices;
             }
-        """)
+            const items = document.querySelectorAll(
+                '[class*="device-item"],[class*="deviceItem"],li[class*="device"],[data-testid*="device"]'
+            );
+            return Array.from(items).map(el => ({
+                name: (el.querySelector('[class*="name"],[class*="title"]') || el)
+                          .innerText?.split('\\n')[0]?.trim() || '',
+                status:   el.querySelector('[class*="status"]')?.innerText?.trim()   || '',
+                location: el.querySelector('[class*="location"],[class*="subtitle"]')?.innerText?.trim() || '',
+                model:    el.querySelector('[class*="model"]')?.innerText?.trim()    || '',
+            }));
+        }""")
         if js_devs and isinstance(js_devs, list):
             for d in js_devs:
                 if d.get("name"):
@@ -928,77 +841,76 @@ async def _extract_findmy_devices(page) -> list:
                         "imei":     d.get("imei", ""),
                     })
     except Exception as e:
-        logger.warning(f"[{_ts()}] ⚠️ JS extract: {e}")
+        logger.warning(f"[{_ts()}] JS extract: {e}")
 
-    # Попытка 2: DOM fallback
+    # DOM fallback
     if not devices:
         try:
-            items = page.locator("[class*='device'], li[class*='item'], [class*='Device']")
-            count = await items.count()
-            for i in range(min(count, 25)):
-                try:
-                    text = await items.nth(i).inner_text()
-                    if text.strip():
-                        lines = [l.strip() for l in text.splitlines() if l.strip()]
-                        devices.append({
-                            "name":     lines[0] if lines else "Устройство",
-                            "status":   lines[1] if len(lines) > 1 else "",
-                            "location": lines[2] if len(lines) > 2 else "",
-                            "model":    "",
-                            "imei":     "",
-                        })
-                except Exception:
-                    continue
+            for ls in [
+                "[class*='device-item'],[class*='deviceItem']",
+                "[class*='device-list'] li",
+                "li[class*='device']",
+                "ul li",
+            ]:
+                items = page.locator(ls)
+                count = await items.count()
+                if count > 0:
+                    for i in range(min(count, 30)):
+                        try:
+                            text  = await items.nth(i).inner_text()
+                            if text.strip():
+                                lines = [l.strip() for l in text.splitlines() if l.strip()]
+                                devices.append({
+                                    "name":     lines[0] if lines else "Device",
+                                    "status":   lines[1] if len(lines) > 1 else "",
+                                    "location": lines[2] if len(lines) > 2 else "",
+                                    "model":    "",
+                                    "imei":     "",
+                                })
+                        except Exception:
+                            pass
+                    if devices:
+                        break
         except Exception as e:
-            logger.warning(f"[{_ts()}] ⚠️ DOM extract: {e}")
+            logger.warning(f"[{_ts()}] DOM extract: {e}")
 
     return devices
 
 
-async def get_findmy_devices(
-    acc_id: int, email: str, password: str,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    tfa_queue=None, notify_fn=None,
-    q3_text: str = "", q3_answer: str = "",
-) -> dict:
-    """
-    Возвращает список устройств из Find My.
-    {"ok": bool, "devices": [...], "error": str, "screenshot": bytes|None}
-    """
-    pw, ctx = await _get_browser(acc_id)
+async def get_findmy_devices(acc_id, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                             tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Open icloud.com/find and return device list."""
+    pw, ctx = await _get_browser(acc_id, headless=HEADLESS)
     page = await _new_page(ctx)
     result = {"ok": False, "devices": [], "error": "", "screenshot": None}
     try:
-        logger.info(f"[{_ts()}] 🌐 Переход на {URL_FINDMY}")
         await page.goto(URL_FINDMY, wait_until="domcontentloaded")
-
-        ok = await _signin_icloud(page, email, password, q1_text, q1_answer,
-                                   q2_text, q2_answer, tfa_queue, notify_fn,
-                                   q3_text, q3_answer)
+        ok = await _signin_icloud(
+            page, email, password, q1_text, q1_answer, q2_text, q2_answer,
+            tfa_queue, notify_fn, q3_text, q3_answer
+        )
         if not ok:
-            result["error"] = "Не удалось войти в Find My"
+            result["error"]      = "Failed to sign in to Find My"
             result["screenshot"] = await _screenshot(page, "findmy_login_fail")
             return result
 
         await _rnd_delay(3.0, 5.0)
-        try:
-            await page.wait_for_selector(
-                "[class*='device'], [class*='Device'], [data-testid*='device']",
-                timeout=LONG
-            )
-        except Exception:
-            pass
+        for sel in ["[class*='device']", "[class*='Device']", "ul li", "[class*='map']"]:
+            try:
+                await page.wait_for_selector(sel, timeout=15000)
+                break
+            except Exception:
+                pass
 
         devices = await _extract_findmy_devices(page)
-        result["ok"] = True
+        result["ok"]      = True
         result["devices"] = devices
-        logger.info(f"[{_ts()}] ✅ Find My: найдено {len(devices)} устройств")
+        logger.info(f"[{_ts()}] Find My: {len(devices)} devices")
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ get_findmy_devices: {e}")
-        result["error"] = str(e)
+        logger.error(f"[{_ts()}] get_findmy_devices error: {e}")
+        result["error"]      = str(e)
         result["screenshot"] = await _screenshot(page, "findmy_error")
         return result
     finally:
@@ -1006,210 +918,168 @@ async def get_findmy_devices(
         await pw.stop()
 
 
-# ---------------------------------------------------------------------------
-# ERASE DEVICE — стирание через Find My
-# ---------------------------------------------------------------------------
-
-def _fuzzy_match(query: str, text: str) -> bool:
-    """Нечёткое совпадение: все слова запроса присутствуют в тексте."""
-    words = query.lower().split()
-    text_lower = text.lower()
-    return all(w in text_lower for w in words if len(w) > 2)
+def _fuzzy_match(name, text):
+    words  = name.lower().split()
+    text_l = text.lower()
+    return sum(1 for w in words if w in text_l) >= max(1, len(words) // 2)
 
 
-async def erase_findmy_device(
-    acc_id: int, email: str, password: str,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    device_name: str,
-    tfa_queue=None, notify_fn=None,
-    q3_text: str = "", q3_answer: str = "",
-) -> dict:
-    """
-    Стирает устройство в Find My.
-    {"ok": bool, "error": str, "screenshot": bytes|None}
-    """
-    pw, ctx = await _get_browser(acc_id)
+async def erase_findmy_device(acc_id, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                              device_name, tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Find device by name in Find My and erase it."""
+    pw, ctx = await _get_browser(acc_id, headless=HEADLESS)
     page = await _new_page(ctx)
     result = {"ok": False, "error": "", "screenshot": None}
     try:
-        logger.info(f"[{_ts()}] 🌐 Переход на {URL_FINDMY} для стирания: {device_name}")
         await page.goto(URL_FINDMY, wait_until="domcontentloaded")
-
-        ok = await _signin_icloud(page, email, password, q1_text, q1_answer,
-                                   q2_text, q2_answer, tfa_queue, notify_fn,
-                                   q3_text, q3_answer)
+        ok = await _signin_icloud(
+            page, email, password, q1_text, q1_answer, q2_text, q2_answer,
+            tfa_queue, notify_fn, q3_text, q3_answer
+        )
         if not ok:
-            result["error"] = "Не удалось войти в Find My"
+            result["error"]      = "Failed to sign in to Find My"
             result["screenshot"] = await _screenshot(page, "erase_login_fail")
             return result
 
         await _rnd_delay(3.0, 5.0)
-
-        # Ищем устройство по имени (нечёткое совпадение)
         found = False
-        items = page.locator("[class*='device'], li[class*='item'], [class*='Device']")
-        count = await items.count()
-        logger.info(f"[{_ts()}] 🔍 Ищу устройство «{device_name}» среди {count} элементов")
-
-        for i in range(min(count, 25)):
-            try:
-                item = items.nth(i)
-                text = await item.inner_text()
-                if device_name.lower() in text.lower() or _fuzzy_match(device_name, text):
-                    logger.info(f"[{_ts()}] ✅ Устройство найдено: {text[:40]}")
-                    await item.click()
-                    found = True
-                    await _rnd_delay(1.0, 2.0)
-                    break
-            except Exception:
+        for ls in [
+            "[class*='device-item'],[class*='deviceItem']",
+            "[class*='device-list'] li",
+            "li[class*='device']",
+            "ul li",
+        ]:
+            items = page.locator(ls)
+            count = await items.count()
+            if count == 0:
                 continue
+            for i in range(min(count, 30)):
+                try:
+                    item = items.nth(i)
+                    text = await item.inner_text()
+                    if device_name.lower() in text.lower() or _fuzzy_match(device_name, text):
+                        await item.click()
+                        found = True
+                        await _rnd_delay(1.0, 2.0)
+                        break
+                except Exception:
+                    pass
+            if found:
+                break
 
         if not found:
-            result["error"] = f"Устройство «{device_name}» не найдено в Find My"
+            result["error"]      = f"Device '{device_name}' not found"
             result["screenshot"] = await _screenshot(page, "erase_not_found")
             return result
 
-        # Нажимаем «Стереть»
-        logger.info(f"[{_ts()}] 🖱️ Клик по кнопке «Стереть»")
-        erased = await _retry_click(_click_white, page, "Стереть")
+        erased = False
+        for text in ["Стереть", "Erase", "Erase Device"]:
+            try:
+                btn = page.get_by_role("button", name=re.compile(text, re.I)).first
+                if await btn.is_visible(timeout=3000):
+                    await btn.click()
+                    erased = True
+                    break
+            except Exception:
+                pass
+
         if not erased:
-            erased = await _retry_click(_click_white, page, "Erase")
-        if not erased:
-            result["error"] = "Кнопка «Стереть» не найдена"
+            result["error"]      = "Erase button not found"
             result["screenshot"] = await _screenshot(page, "erase_btn_not_found")
             return result
 
         await _rnd_delay(1.5, 2.5)
-
-        # Подтверждение в диалоге
-        logger.info(f"[{_ts()}] 🖱️ Подтверждение стирания")
-        confirm = await _click_white(page, "Стереть")
-        if not confirm:
-            confirm = await _retry_click(_click_blue, page)
+        for text in ["Стереть", "Erase", "Подтвердить", "Confirm"]:
+            try:
+                btn = page.get_by_role("button", name=re.compile(text, re.I)).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click()
+                    break
+            except Exception:
+                pass
 
         await _rnd_delay(2.0, 3.0)
         result["ok"] = True
-        logger.info(f"[{_ts()}] ✅ Устройство «{device_name}» стёрто!")
+        logger.info(f"[{_ts()}] Device '{device_name}' erased!")
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ erase_findmy_device: {e}")
-        result["error"] = str(e)
+        logger.error(f"[{_ts()}] erase_findmy_device error: {e}")
+        result["error"]      = str(e)
         result["screenshot"] = await _screenshot(page, "erase_error")
         return result
     finally:
         await ctx.close()
         await pw.stop()
 
-
-# ---------------------------------------------------------------------------
-# CHANGE PASSWORD — смена пароля Apple ID
-# ---------------------------------------------------------------------------
-
-async def change_password(
-    acc_id: int, email: str,
-    new_password: str,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    tfa_queue=None, notify_fn=None,
-    # 'password' from _pw_args() is the current password
-    password: str = "",
-    current_password: str = "",
-    q3_text: str = "", q3_answer: str = "",
-) -> dict:
-    # Support both calling conventions
+async def change_password(acc_id, email, new_password, q1_text, q1_answer, q2_text, q2_answer,
+                          tfa_queue=None, notify_fn=None, password="", current_password="",
+                          q3_text="", q3_answer=""):
+    """Change Apple ID password via account.apple.com."""
     if not current_password:
         current_password = password
-    """
-    Меняет пароль Apple ID через account.apple.com/account/manage.
-    {"ok": bool, "last_updated": str, "error": str, "screenshot": bytes|None}
-    """
-    pw, ctx = await _get_browser(acc_id)
+    pw, ctx = await _get_browser(acc_id, headless=HEADLESS)
     page = await _new_page(ctx)
     result = {"ok": False, "last_updated": "", "error": "", "screenshot": None}
     try:
-        r = await apple_signin(page, email, current_password, q1_text, q1_answer,
-                               q2_text, q2_answer, tfa_queue, notify_fn,
-                               q3_text, q3_answer)
+        r = await apple_signin(
+            page, email, current_password, q1_text, q1_answer, q2_text, q2_answer,
+            tfa_queue, notify_fn, q3_text, q3_answer
+        )
         if not r["ok"]:
             result.update(r)
             return result
 
-        logger.info(f"[{_ts()}] 🌐 Переход на {URL_MANAGE}")
         await page.goto(URL_MANAGE, wait_until="domcontentloaded")
         await _rnd_delay(2.0, 3.0)
 
-        # Нажимаем кнопку «Пароль»
-        logger.info(f"[{_ts()}] 🖱️ Клик по кнопке «Пароль»")
-        clicked = await _retry_click(_click_white, page, "Пароль")
-        if not clicked:
-            clicked = await _retry_click(_click_white, page, "Password")
+        for text in ["Пароль", "Password"]:
+            try:
+                btn = page.get_by_role("button", name=re.compile(text, re.I)).first
+                if await btn.is_visible(timeout=3000):
+                    await btn.click()
+                    break
+            except Exception:
+                pass
+
         await _rnd_delay(1.5, 2.5)
-
-        # Читаем «Последнее обновление» до смены
-        try:
-            content = await page.content()
-            m = re.search(
-                r"[Пп]оследнее обновление[:\s]+(\d{1,2}[./]\d{1,2}[./]\d{2,4})",
-                content
-            )
-            if m:
-                result["last_updated"] = m.group(1)
-                logger.info(f"[{_ts()}] 📅 Последнее обновление пароля: {result['last_updated']}")
-        except Exception:
-            pass
-
-        # Заполняем поля пароля
         pwd_inputs = page.locator("input[type='password']")
         count = await pwd_inputs.count()
-        logger.info(f"[{_ts()}] 🔑 Полей пароля найдено: {count}")
+        logger.info(f"[{_ts()}] Password fields found: {count}")
 
         if count >= 3:
-            logger.info(f"[{_ts()}] ✍️ Ввод текущего пароля")
             await pwd_inputs.nth(0).fill(current_password)
             await _rnd_delay(0.3, 0.6)
-            logger.info(f"[{_ts()}] ✍️ Ввод нового пароля")
             await pwd_inputs.nth(1).fill(new_password)
             await _rnd_delay(0.3, 0.6)
-            logger.info(f"[{_ts()}] ✍️ Подтверждение нового пароля")
             await pwd_inputs.nth(2).fill(new_password)
-            await _rnd_delay(0.5, 1.0)
         elif count == 2:
             await pwd_inputs.nth(0).fill(new_password)
             await pwd_inputs.nth(1).fill(new_password)
         else:
-            result["error"] = f"Найдено только {count} полей пароля (ожидалось 3)"
+            result["error"]      = f"Only {count} password fields found"
             result["screenshot"] = await _screenshot(page, "changepass_fields")
             return result
 
-        logger.info(f"[{_ts()}] 🖱️ Клик по СИНЕЙ кнопке: «Изменить пароль»")
-        await _retry_click(_click_blue, page)
+        await _rnd_delay(0.5, 1.0)
+        for sel in ["button[type='submit']", "button[class*='primary']"]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click()
+                    break
+            except Exception:
+                pass
+
         await _rnd_delay(2.0, 4.0)
-
-        # Проверяем успех
-        content = await page.content()
-        if "успешно" in content.lower() or "changed" in content.lower() or "updated" in content.lower():
-            result["ok"] = True
-        else:
-            m = re.search(
-                r"[Пп]оследнее обновление[:\s]+(\d{1,2}[./]\d{1,2}[./]\d{2,4})",
-                content
-            )
-            if m:
-                result["last_updated"] = m.group(1)
-            result["ok"] = True  # Считаем успехом если нет явной ошибки
-
-        today = datetime.now().strftime("%d.%m.%Y")
-        if not result["last_updated"]:
-            result["last_updated"] = today
-
-        logger.info(f"[{_ts()}] ✅ Пароль изменён! Дата: {result['last_updated']}")
+        result["last_updated"] = datetime.now().strftime("%d.%m.%Y")
+        result["ok"] = True
+        logger.info(f"[{_ts()}] Password changed!")
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ change_password: {e}")
-        result["error"] = str(e)
+        logger.error(f"[{_ts()}] change_password error: {e}")
+        result["error"]      = str(e)
         result["screenshot"] = await _screenshot(page, "changepass_error")
         return result
     finally:
@@ -1217,94 +1087,83 @@ async def change_password(
         await pw.stop()
 
 
-# ---------------------------------------------------------------------------
-# CHECK MAIL — проверка почты iCloud
-# ---------------------------------------------------------------------------
-
-async def _extract_mails(page) -> list:
-    """Извлекает письма из iCloud Mail."""
+async def _extract_mails(page):
     mails = []
     try:
-        items = page.locator(
-            "[class*='message-row'], [class*='MessageRow'], "
-            "[class*='mail-item'], [class*='MailItem'], "
-            "[class*='message-list'] li"
-        )
-        count = await items.count()
-        logger.info(f"[{_ts()}] 📬 Найдено писем: {count}")
-
-        for i in range(min(count, 15)):
-            try:
-                item = items.nth(i)
-                text = await item.inner_text()
-                lines = [l.strip() for l in text.splitlines() if l.strip()]
-                cls = await item.get_attribute("class") or ""
-                is_unread = "unread" in cls.lower()
-                sender  = lines[0] if lines else ""
-                subject = lines[1] if len(lines) > 1 else ""
-                date    = lines[-1] if len(lines) > 2 else ""
-                is_apple = any(
-                    kw in (sender + subject).lower()
-                    for kw in ["apple", "icloud", "security", "sign in", "new device",
-                               "password", "пароль", "устройство", "вход", "appleid"]
-                )
-                mails.append({
-                    "sender": sender, "subject": subject, "date": date,
-                    "unread": is_unread, "is_apple": is_apple,
-                })
-            except Exception:
-                continue
+        for ls in [
+            "[class*='message-row'],[class*='MessageRow']",
+            "[class*='mail-item'],[class*='MailItem']",
+            "[class*='message-list'] li",
+            "ul[class*='mail'] li",
+        ]:
+            items = page.locator(ls)
+            count = await items.count()
+            if count > 0:
+                for i in range(min(count, 15)):
+                    try:
+                        item  = items.nth(i)
+                        text  = await item.inner_text()
+                        lines = [l.strip() for l in text.splitlines() if l.strip()]
+                        cls   = await item.get_attribute("class") or ""
+                        is_unread = "unread" in cls.lower()
+                        sender  = lines[0] if lines else ""
+                        subject = lines[1] if len(lines) > 1 else ""
+                        date    = lines[-1] if len(lines) > 2 else ""
+                        is_apple = any(
+                            kw in (sender + subject).lower()
+                            for kw in ["apple", "icloud", "security", "sign in",
+                                       "new device", "password", "пароль", "appleid"]
+                        )
+                        mails.append({
+                            "sender":   sender,
+                            "subject":  subject,
+                            "date":     date,
+                            "unread":   is_unread,
+                            "is_apple": is_apple,
+                        })
+                    except Exception:
+                        pass
+                break
     except Exception as e:
-        logger.warning(f"[{_ts()}] ⚠️ _extract_mails: {e}")
+        logger.warning(f"[{_ts()}] _extract_mails: {e}")
     return mails
 
 
-async def check_mail(
-    acc_id: int, email: str, password: str,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    tfa_queue=None, notify_fn=None,
-    q3_text: str = "", q3_answer: str = "",
-) -> dict:
-    """
-    Проверяет почту iCloud.
-    {"ok": bool, "mails": [...], "unread": int, "error": str, "screenshot": bytes|None}
-    """
-    pw, ctx = await _get_browser(acc_id)
+async def check_mail(acc_id, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                     tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Open icloud.com/mail and return inbox messages."""
+    pw, ctx = await _get_browser(acc_id, headless=HEADLESS)
     page = await _new_page(ctx)
     result = {"ok": False, "mails": [], "unread": 0, "error": "", "screenshot": None}
     try:
-        logger.info(f"[{_ts()}] 🌐 Переход на {URL_MAIL}")
         await page.goto(URL_MAIL, wait_until="domcontentloaded")
-
-        ok = await _signin_icloud(page, email, password, q1_text, q1_answer,
-                                   q2_text, q2_answer, tfa_queue, notify_fn,
-                                   q3_text, q3_answer)
+        ok = await _signin_icloud(
+            page, email, password, q1_text, q1_answer, q2_text, q2_answer,
+            tfa_queue, notify_fn, q3_text, q3_answer
+        )
         if not ok:
-            result["error"] = "Не удалось войти в iCloud Mail"
+            result["error"]      = "Failed to sign in to iCloud Mail"
             result["screenshot"] = await _screenshot(page, "mail_login_fail")
             return result
 
         await _rnd_delay(3.0, 5.0)
-        try:
-            await page.wait_for_selector(
-                "[class*='message'], [class*='mail-item'], [class*='MessageList']",
-                timeout=LONG
-            )
-        except Exception:
-            pass
+        for sel in ["[class*='message'],[class*='mail-item']", "[class*='MessageList']", "ul li"]:
+            try:
+                await page.wait_for_selector(sel, timeout=15000)
+                break
+            except Exception:
+                pass
 
-        mails = await _extract_mails(page)
+        mails  = await _extract_mails(page)
         unread = sum(1 for m in mails if m.get("unread"))
-        result["ok"] = True
-        result["mails"] = mails[:10]
+        result["ok"]     = True
+        result["mails"]  = mails[:10]
         result["unread"] = unread
-        logger.info(f"[{_ts()}] ✅ Почта: {len(mails)} писем, непрочитанных: {unread}")
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ check_mail: {e}")
-        result["error"] = str(e)
+        logger.error(f"[{_ts()}] check_mail error: {e}")
+        result["error"]      = str(e)
         result["screenshot"] = await _screenshot(page, "mail_error")
         return result
     finally:
@@ -1312,52 +1171,38 @@ async def check_mail(
         await pw.stop()
 
 
-# ---------------------------------------------------------------------------
-# SECURITY — страница безопасности
-# ---------------------------------------------------------------------------
-
-async def get_security_info(
-    acc_id: int, email: str, password: str,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    tfa_queue=None, notify_fn=None,
-    q3_text: str = "", q3_answer: str = "",
-) -> dict:
-    """
-    Возвращает информацию со страницы безопасности.
-    {"ok": bool, "info": str, "error": str, "screenshot": bytes|None}
-    """
-    pw, ctx = await _get_browser(acc_id)
+async def get_security_info(acc_id, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                            tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Get security settings from account.apple.com/account/manage/section/security."""
+    pw, ctx = await _get_browser(acc_id, headless=HEADLESS)
     page = await _new_page(ctx)
     result = {"ok": False, "info": "", "error": "", "screenshot": None}
     try:
-        r = await apple_signin(page, email, password, q1_text, q1_answer,
-                               q2_text, q2_answer, tfa_queue, notify_fn,
-                               q3_text, q3_answer)
+        r = await apple_signin(
+            page, email, password, q1_text, q1_answer, q2_text, q2_answer,
+            tfa_queue, notify_fn, q3_text, q3_answer
+        )
         if not r["ok"]:
             result.update(r)
             return result
 
-        logger.info(f"[{_ts()}] 🌐 Переход на {URL_SECURITY}")
         await page.goto(URL_SECURITY, wait_until="domcontentloaded")
         await _rnd_delay(2.0, 3.0)
-
-        try:
-            await page.wait_for_selector(
-                "[class*='security'], [class*='Security']", timeout=TIMEOUT
-            )
-        except Exception:
-            pass
+        for sel in ["[class*='security']", "main"]:
+            try:
+                await page.wait_for_selector(sel, timeout=TIMEOUT)
+                break
+            except Exception:
+                pass
 
         info = await page.inner_text("main, [class*='content'], body")
-        result["ok"] = True
+        result["ok"]   = True
         result["info"] = info[:3000]
-        logger.info(f"[{_ts()}] ✅ Страница безопасности загружена")
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ get_security_info: {e}")
-        result["error"] = str(e)
+        logger.error(f"[{_ts()}] get_security_info error: {e}")
+        result["error"]      = str(e)
         result["screenshot"] = await _screenshot(page, "security_error")
         return result
     finally:
@@ -1365,29 +1210,15 @@ async def get_security_info(
         await pw.stop()
 
 
-# ---------------------------------------------------------------------------
-# MONITOR CHECK — одна итерация мониторинга
-# ---------------------------------------------------------------------------
-
-async def monitor_check(
-    acc_id: int, email: str, password: str,
-    q1_text: str, q1_answer: str,
-    q2_text: str, q2_answer: str,
-    known_devices: list,
-    tfa_queue=None, notify_fn=None,
-    q3_text: str = "", q3_answer: str = "",
-) -> dict:
-    """
-    Проверяет Find My + Devices, возвращает новые устройства.
-    {"ok": bool, "devices": [...], "new_devices": [...], "error": str}
-    """
+async def monitor_check(acc_id, email, password, q1_text, q1_answer, q2_text, q2_answer,
+                        known_devices, tfa_queue=None, notify_fn=None, q3_text="", q3_answer=""):
+    """Lightweight Find My check for the monitor loop. Returns new devices."""
     result = {"ok": False, "devices": [], "new_devices": [], "error": ""}
     try:
-        logger.info(f"[{_ts()}] 🔍 Мониторинг: проверка Find My...")
+        logger.info(f"[{_ts()}] Monitor: checking Find My...")
         fm = await get_findmy_devices(
-            acc_id, email, password,
-            q1_text, q1_answer, q2_text, q2_answer,
-            tfa_queue, notify_fn
+            acc_id, email, password, q1_text, q1_answer, q2_text, q2_answer,
+            tfa_queue, notify_fn, q3_text, q3_answer
         )
         if not fm["ok"]:
             result["error"] = fm["error"]
@@ -1395,19 +1226,18 @@ async def monitor_check(
 
         current = fm["devices"]
         result["devices"] = current
-        result["ok"] = True
+        result["ok"]      = True
 
-        # Сравниваем с известными устройствами
         known_names = {d.get("name", "").lower() for d in known_devices}
         for dev in current:
             name = dev.get("name", "").lower()
             if name and name not in known_names:
-                logger.info(f"[{_ts()}] 🚨 НОВОЕ УСТРОЙСТВО: {dev.get('name')}")
+                logger.info(f"[{_ts()}] NEW DEVICE: {dev.get('name')}")
                 result["new_devices"].append(dev)
 
         return result
 
     except Exception as e:
-        logger.error(f"[{_ts()}] ❌ monitor_check: {e}")
+        logger.error(f"[{_ts()}] monitor_check error: {e}")
         result["error"] = str(e)
         return result

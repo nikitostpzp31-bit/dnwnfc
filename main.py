@@ -1,74 +1,87 @@
-"""
-Точка входа. Запуск: python main.py
-"""
+"""Entry point for Apple ID Monitor Bot."""
 import asyncio
-import signal
+import os
 import sys
 
 import db
-from bot import create_bot_and_dispatcher, notify
+from bot import create_bot_and_dispatcher
 from config import FERNET_KEY, MONITOR_INTERVAL, TELEGRAM_TOKEN
 from logger import get_logger
 
 logger = get_logger()
 
 
-def _ensure_fernet_key() -> None:
-    """Генерирует FERNET_KEY если не задан и выводит его для .env."""
-    if not FERNET_KEY:
-        from cryptography.fernet import Fernet
-        key = Fernet.generate_key().decode()
-        logger.warning(
-            "FERNET_KEY не задан в .env. Пароли хранятся без шифрования.\n"
-            f"Сгенерируйте ключ и добавьте в .env:\n  FERNET_KEY={key}"
-        )
+async def _force_session(bot):
+    """Force-acquire Telegram polling session, displacing any existing connection."""
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
 
-
-async def main() -> None:
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN не задан в .env. Выход.")
-        sys.exit(1)
-
-    _ensure_fernet_key()
-
-    logger.info("=" * 50)
-    logger.info("🍎 Apple ID Monitor Bot — запуск")
-    logger.info(f"   Интервал мониторинга: {MONITOR_INTERVAL} сек")
-    logger.info("=" * 50)
-
-    db.init_db()
-
-    bot, dp = create_bot_and_dispatcher()
-
-    # Сбрасываем webhook и вытесняем конкурирующий polling
-    logger.info("Сброс webhook...")
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    for attempt in range(20):
+    for attempt in range(1, 121):
         try:
             await bot.get_updates(offset=-1, timeout=0)
-            logger.info(f"Сессия захвачена (попытка {attempt + 1})")
-            break
+            logger.info(f"Session acquired (attempt {attempt})")
+            return
         except Exception as e:
             if "Conflict" in str(e):
-                logger.warning(f"Конфликт сессии, попытка {attempt + 1}/20...")
-                await asyncio.sleep(2)
+                if attempt % 10 == 1:
+                    logger.warning(f"Session conflict ({attempt}/120), retrying...")
+                await asyncio.sleep(5)
             else:
-                break
+                # Non-conflict error — just proceed
+                return
 
-    # Восстанавливаем мониторинг если был включён до перезапуска
-    if db.get_config("monitor", "off") == "on":
-        from bot import _monitor_loop
-        import asyncio as _asyncio
-        logger.info("Восстанавливаю мониторинг после перезапуска...")
-        _asyncio.create_task(_monitor_loop())
 
-    logger.info("✅ Бот запущен и ожидает команды")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+async def run_bot():
+    db.init_db()
+    bot, dp = create_bot_and_dispatcher()
+
+    async def on_startup(**kwargs):
+        if db.get_config("monitor", "off") == "on":
+            from bot import _monitor_loop
+            logger.info("Restoring monitor task...")
+            asyncio.create_task(_monitor_loop())
+
+    dp.startup.register(on_startup)
+
+    while True:
+        try:
+            await _force_session(bot)
+            logger.info("Bot polling started")
+            await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+            break  # clean exit (KeyboardInterrupt etc.)
+
+        except Exception as e:
+            if "Conflict" in str(e):
+                logger.warning(f"Polling conflict, retrying in 30s: {e}")
+                await asyncio.sleep(30)
+            else:
+                logger.error(f"Fatal error: {e}")
+                raise
+
+
+async def main():
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN not set")
+        sys.exit(1)
+    if not FERNET_KEY:
+        from cryptography.fernet import Fernet
+        logger.warning(
+            f"FERNET_KEY not set — passwords stored unencrypted. "
+            f"Generate one: FERNET_KEY={Fernet.generate_key().decode()}"
+        )
+
+    logger.info("=" * 50)
+    logger.info(f"Apple ID Monitor Bot starting (PID={os.getpid()})")
+    logger.info(f"Monitor interval: {MONITOR_INTERVAL}s")
+    logger.info("=" * 50)
+
+    await run_bot()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен (Ctrl+C)")
+        logger.info("Bot stopped by user")
